@@ -4,8 +4,12 @@ use relm4::gtk::gdk::ModifierType;
 
 use crate::{
     configuration::APP_CONFIG,
-    math::{Vec2D, get_closest_aspect_ratio},
+    math::{
+        Vec2D, get_closest_aspect_ratio,
+        homography::{Quad, outset_quad},
+    },
     sketch_board::{MouseEventMsg, SketchBoardInput},
+    tools::projected::quad_path,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -118,27 +122,39 @@ pub fn draw_center_marker(canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl
     canvas.stroke_path(&path, &outer_color().with_line_width(1.5 / scale));
 }
 
+// in inverse zoom scale so the visual size stays constant on screen
+fn marker_line_width(canvas: &femtovg::Canvas<femtovg::renderer::OpenGl>) -> f32 {
+    1.5 / canvas.transform().average_scale().max(f32::EPSILON)
+}
+
+// a marker is `inner` in the inner color, filled or stroked, and a stroke
+// along `outer` in the outer color
+fn draw_marker(
+    canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
+    inner: &Path,
+    outer: &Path,
+    filled: bool,
+) {
+    let line_width = marker_line_width(canvas);
+    let border_paint = inner_color().with_line_width(line_width);
+    if filled {
+        canvas.fill_path(inner, &border_paint);
+    } else {
+        canvas.stroke_path(inner, &border_paint);
+    }
+    canvas.stroke_path(outer, &outer_color().with_line_width(line_width));
+}
+
 pub fn draw_rect_marker(
     canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
     top_left: Vec2D,
     size: Vec2D,
     filled: bool,
 ) {
-    // draw in inverse zoom scale so the visual size stays constant on screen
-    let scale = canvas.transform().average_scale().max(f32::EPSILON);
-    let line_width = 1.5 / scale;
+    let line_width = marker_line_width(canvas);
+    let mut inner = Path::new();
+    inner.rect(top_left.x, top_left.y, size.x, size.y);
 
-    let border_paint = inner_color().with_line_width(line_width);
-    let mut border_path = Path::new();
-
-    border_path.rect(top_left.x, top_left.y, size.x, size.y);
-    if filled {
-        canvas.fill_path(&border_path, &border_paint);
-    } else {
-        canvas.stroke_path(&border_path, &border_paint);
-    }
-
-    let border_paint = outer_color().with_line_width(line_width);
     let mut tl = top_left;
     let mut size = size;
 
@@ -148,7 +164,21 @@ pub fn draw_rect_marker(
         size = size + 2.0 * line_width;
     }
 
-    let mut border_path = Path::new();
-    border_path.rect(tl.x, tl.y, size.x, size.y);
-    canvas.stroke_path(&border_path, &border_paint);
+    let mut outer = Path::new();
+    outer.rect(tl.x, tl.y, size.x, size.y);
+    draw_marker(canvas, &inner, &outer, filled);
+}
+
+// like draw_rect_marker, for a strictly convex quad
+pub fn draw_quad_marker(
+    canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
+    quad: &Quad,
+    filled: bool,
+) {
+    let outer = if filled {
+        *quad
+    } else {
+        outset_quad(quad, marker_line_width(canvas))
+    };
+    draw_marker(canvas, &quad_path(quad), &quad_path(&outer), filled);
 }

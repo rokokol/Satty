@@ -26,8 +26,8 @@ use crate::math::{Vec2D, crop_rect_in_bounds};
 use crate::notification::{log_result, log_result_with_pixbuf};
 use crate::style::{Color, Size, Style};
 use crate::tools::{
-    ImagePlacement, PointerTool, RenderingMode, TextTool, Tool, ToolEvent, ToolUpdateResult, Tools,
-    ToolsManager,
+    Frame, ImagePlacement, PointerTool, Projected, RenderingMode, TextTool, Tool, ToolEvent,
+    ToolUpdateResult, Tools, ToolsManager,
 };
 use crate::ui::toolbars::ToolbarEvent;
 use xdg::BaseDirectories;
@@ -1086,16 +1086,14 @@ impl SketchBoard {
         if let Some(handle) = handle_hit {
             let sel_idx = self.pointer_tool.borrow().selected_index();
             if let Some(idx) = sel_idx
-                && let (Some(drawable), Some(bounds)) = (
-                    self.renderer.get_drawable_clone(idx),
-                    self.renderer.get_drawable_bounds(idx),
-                )
+                && let Some(drawable) = self.renderer.get_drawable_clone(idx)
+                && drawable.bounds().is_some()
             {
                 self.sync_toolbar_style_from_drawable(drawable.as_ref(), sender);
                 self.renderer.set_hidden_drawable_index(Some(idx));
                 self.pointer_tool
                     .borrow_mut()
-                    .begin_resize(idx, drawable, handle, bounds, me.pos);
+                    .begin_resize(idx, drawable, handle, me.pos);
                 return Some(ToolUpdateResult::Redraw);
             }
         }
@@ -1107,12 +1105,12 @@ impl SketchBoard {
             && let Some(selected_idx) = selected_idx
             && let Some(drawable) = self.renderer.get_drawable_clone(selected_idx)
             && drawable.hit_test(me.pos, crate::tools::HIT_BORDER_TOLERANCE)
-            && let Some((tl, br)) = self.renderer.get_drawable_bounds(selected_idx)
+            && drawable.bounds().is_some()
         {
             self.renderer.set_hidden_drawable_index(Some(selected_idx));
             self.pointer_tool
                 .borrow_mut()
-                .begin_move(selected_idx, drawable, (tl, br), me.pos);
+                .begin_move(selected_idx, drawable, me.pos);
             return Some(ToolUpdateResult::Redraw);
         }
 
@@ -1134,16 +1132,14 @@ impl SketchBoard {
         };
 
         if let Some(sel_idx) = idx_to_select
-            && let (Some(drawable), Some(bounds)) = (
-                self.renderer.get_drawable_clone(sel_idx),
-                self.renderer.get_drawable_bounds(sel_idx),
-            )
+            && let Some(drawable) = self.renderer.get_drawable_clone(sel_idx)
+            && drawable.bounds().is_some()
         {
             self.sync_toolbar_style_from_drawable(drawable.as_ref(), sender);
             self.renderer.set_hidden_drawable_index(Some(sel_idx));
             self.pointer_tool
                 .borrow_mut()
-                .begin_move(sel_idx, drawable, bounds, me.pos);
+                .begin_move(sel_idx, drawable, me.pos);
             return Some(ToolUpdateResult::Redraw);
         }
 
@@ -1161,6 +1157,14 @@ impl SketchBoard {
     ) -> Option<ToolUpdateResult> {
         let idx = self.renderer.hit_test(pos).first().copied()?;
         let drawable = self.renderer.get_drawable_clone(idx)?;
+        // a projected text is edited flat and projected again on commit
+        let (drawable, projection) = match drawable.as_any().downcast_ref::<Projected>() {
+            Some(projected) => {
+                let (inner, h) = projected.clone().into_parts();
+                (inner, Some(h))
+            }
+            None => (drawable, None),
+        };
         let text = drawable
             .as_any()
             .downcast_ref::<crate::tools::Text>()?
@@ -1172,7 +1176,9 @@ impl SketchBoard {
         self.renderer.remove_drawable(idx);
 
         // Pre-populate the text tool and switch to it
-        self.text_tool.borrow_mut().load_for_editing(text);
+        self.text_tool
+            .borrow_mut()
+            .load_for_editing(text, projection);
         self.return_to_pointer_after_text_commit = true;
 
         sender
@@ -1553,21 +1559,21 @@ impl SketchBoard {
             return ToolUpdateResult::Unmodified;
         }
 
-        let Some(bounds) = self.renderer.get_drawable_bounds(index) else {
+        let Some(frame) = Frame::of(drawable.as_ref()) else {
             return ToolUpdateResult::Unmodified;
         };
 
         let needs_update = {
             let pointer_tool = self.pointer_tool.borrow();
             pointer_tool.selected_index() != Some(index)
-                || pointer_tool.selected_bounds() != Some(bounds)
+                || pointer_tool.selected_frame() != Some(frame)
         };
 
         if !needs_update {
             return ToolUpdateResult::Unmodified;
         }
 
-        self.pointer_tool.borrow_mut().set_selection(index, bounds);
+        self.pointer_tool.borrow_mut().set_selection(index, frame);
         ToolUpdateResult::Redraw
     }
 
@@ -1979,11 +1985,10 @@ impl Component for SketchBoard {
 
                 if auto_select {
                     if let Some(index) = committed_index
-                        && let Some(new_bounds) = self.renderer.get_drawable_bounds(index)
+                        && let Some(drawable) = self.renderer.get_drawable_clone(index)
+                        && let Some(frame) = Frame::of(drawable.as_ref())
                     {
-                        self.pointer_tool
-                            .borrow_mut()
-                            .set_selection(index, new_bounds);
+                        self.pointer_tool.borrow_mut().set_selection(index, frame);
                     }
 
                     if self.active_tool_type() != Tools::Pointer {

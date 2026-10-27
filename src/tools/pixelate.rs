@@ -314,6 +314,39 @@ impl Drawable for Pixelate {
         Ok(())
     }
 
+    fn effect_paint(
+        &self,
+        canvas: &mut Canvas<OpenGl>,
+        image: &ImgVec<RGBA8>,
+        bounds: (Vec2D, Vec2D),
+    ) -> Result<Option<Paint>> {
+        let (pos, size) = math::rect_ensure_in_bounds(
+            math::rect_ensure_positive_size(self.top_left, self.size),
+            bounds,
+        );
+
+        if (self.cached_image.borrow().is_none() || self.editing)
+            && let Some(x) = self.pixelate(canvas, image, pos, size)?
+        {
+            self.cached_image.borrow_mut().replace(x);
+        }
+
+        Ok(self
+            .cached_image
+            .borrow()
+            .map(|(image_id, paint_pos, paint_size)| {
+                Paint::image(
+                    image_id,
+                    paint_pos.x,
+                    paint_pos.y,
+                    paint_size.x,
+                    paint_size.y,
+                    0f32,
+                    1f32,
+                )
+            }))
+    }
+
     fn draw_baselayer(
         &self,
         canvas: &mut Canvas<OpenGl>,
@@ -326,13 +359,9 @@ impl Drawable for Pixelate {
             bounds,
         );
 
-        if (self.cached_image.borrow().is_none() || self.editing)
-            && let Some(x) = self.pixelate(canvas, image, pos, size)?
+        if let Some(paint) = self.effect_paint(canvas, image, bounds)?
+            && let Some((_, paint_pos, paint_size)) = *self.cached_image.borrow()
         {
-            self.cached_image.borrow_mut().replace(x);
-        }
-
-        if let Some((image_id, paint_pos, paint_size)) = *self.cached_image.borrow() {
             let mut path = Path::new();
             path.rounded_rect(
                 paint_pos.x,
@@ -341,18 +370,7 @@ impl Drawable for Pixelate {
                 paint_size.y,
                 self.style.corner_radius(),
             );
-            canvas.fill_path(
-                &path,
-                &Paint::image(
-                    image_id,
-                    paint_pos.x,
-                    paint_pos.y,
-                    paint_size.x,
-                    paint_size.y,
-                    0f32,
-                    1f32,
-                ),
-            );
+            canvas.fill_path(&path, &paint);
         }
 
         if self.editing && self.centered {

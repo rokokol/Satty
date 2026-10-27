@@ -26,7 +26,7 @@ use crate::{
     epoxy,
     math::Vec2D,
     sketch_board::SketchBoardInput,
-    tools::{Drawable, RenderingMode, Tool, Tools},
+    tools::{Drawable, PrepareContext, RenderingMode, Tool, Tools},
 };
 
 use super::{font_stack, set_font_stack};
@@ -701,7 +701,7 @@ impl FemtoVgAreaMut {
             canvas,
             font,
             femtovg::Color::rgbaf(0.0, 0.0, 0.0, 0.0),
-            false,
+            femtovg::RenderTarget::Image(image_id),
         )?;
 
         // return screenshot
@@ -733,26 +733,23 @@ impl FemtoVgAreaMut {
             canvas,
             font,
             femtovg::Color::rgbaf(0.0, 0.0, 0.0, 0.0),
-            true,
+            femtovg::RenderTarget::Screen,
         )?;
 
         Ok(())
     }
 
+    // draws the frame into `target`, which must be the current render target;
+    // only the screen gets the parts that are not for export
     fn render(
         &mut self,
         canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
         font: FontId,
         outside_bg_color: femtovg::Color,
-        onscreen: bool,
+        target: femtovg::RenderTarget,
     ) -> Result<()> {
+        let onscreen = target == femtovg::RenderTarget::Screen;
         let source_image = self.ensure_source_image();
-
-        // clear canvas
-        canvas.clear_rect(0, 0, canvas.width(), canvas.height(), outside_bg_color);
-
-        // render background image (screenshot)
-        self.render_background_image(canvas, onscreen)?;
 
         let bounds = (
             Vec2D::zero(),
@@ -763,15 +760,77 @@ impl FemtoVgAreaMut {
         );
 
         // offscreen export should not include pointer selection overlay
-        let mut draw_active_tool =
+        let draw_active_tool =
             onscreen || self.active_tool.borrow().get_tool_type() != Tools::Pointer;
+
+        let mut context = PrepareContext {
+            font,
+            bounds,
+            target,
+            images: Vec::new(),
+        };
+        let result = self
+            .prepare_drawables(canvas, &mut context, draw_active_tool)
+            .and_then(|()| {
+                self.render_prepared(
+                    canvas,
+                    font,
+                    outside_bg_color,
+                    onscreen,
+                    bounds,
+                    &source_image,
+                    draw_active_tool,
+                )
+            });
+        // the offscreen images are read by the commands queued above, so they
+        // can only go once these are flushed
+        canvas.flush();
+        for image in context.images {
+            canvas.delete_image(image);
+        }
+        result
+    }
+
+    fn prepare_drawables(
+        &self,
+        canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
+        context: &mut PrepareContext,
+        draw_active_tool: bool,
+    ) -> Result<()> {
+        for (i, d) in self.drawables.iter().enumerate() {
+            if self.hidden_drawable_index != Some(i) {
+                d.prepare(canvas, context)?;
+            }
+        }
+        if draw_active_tool && let Some(preview) = self.active_tool.borrow().get_drawable() {
+            preview.prepare(canvas, context)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_prepared(
+        &mut self,
+        canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
+        font: FontId,
+        outside_bg_color: femtovg::Color,
+        onscreen: bool,
+        bounds: (Vec2D, Vec2D),
+        source_image: &ImgVec<RGBA8>,
+        mut draw_active_tool: bool,
+    ) -> Result<()> {
+        // clear canvas
+        canvas.clear_rect(0, 0, canvas.width(), canvas.height(), outside_bg_color);
+
+        // render background image (screenshot)
+        self.render_background_image(canvas, onscreen)?;
 
         // draw blur first, so it is below everything else
         for (i, d) in self.drawables.iter().enumerate() {
             if self.hidden_drawable_index != Some(i)
                 && d.get_rendering_mode() == RenderingMode::Blur
             {
-                d.draw_baselayer(canvas, &source_image, font, bounds)?;
+                d.draw_baselayer(canvas, source_image, font, bounds)?;
             }
         }
 
@@ -780,7 +839,7 @@ impl FemtoVgAreaMut {
             && let Some(preview) = self.active_tool.borrow().get_drawable()
             && preview.get_rendering_mode() == RenderingMode::Blur
         {
-            preview.draw_baselayer(canvas, &source_image, font, bounds)?;
+            preview.draw_baselayer(canvas, source_image, font, bounds)?;
             draw_active_tool = false;
         }
 

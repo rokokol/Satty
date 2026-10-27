@@ -1,3 +1,5 @@
+pub mod homography;
+
 use std::{
     f32::consts::PI,
     fmt::Display,

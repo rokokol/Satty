@@ -12,7 +12,7 @@ use std::{
 use anyhow::Result;
 use femtovg::imgref::ImgVec;
 use femtovg::rgb::RGBA8;
-use femtovg::{Canvas, FontId, renderer::OpenGl};
+use femtovg::{Canvas, FontId, ImageId, Paint, RenderTarget, renderer::OpenGl};
 use relm4::gtk::gdk_pixbuf::{
     Pixbuf,
     glib::{Variant, VariantTy},
@@ -27,7 +27,7 @@ use relm4::{
 use serde_derive::Deserialize;
 
 use crate::{
-    math::{SegmentResizeTarget, Vec2D, ensure_bounding_box},
+    math::{SegmentResizeTarget, Vec2D, ensure_bounding_box, homography::Homography},
     sketch_board::{InputEvent, KeyEventMsg, MouseEventMsg, SketchBoardInput, TextEventMsg},
     style::Style,
 };
@@ -46,6 +46,7 @@ mod line;
 mod marker;
 mod pixelate;
 mod pointer;
+mod projected;
 mod rectangle;
 mod text;
 
@@ -204,9 +205,34 @@ where
     }
 }
 
+/// What `Drawable::prepare` needs besides the canvas.
+pub struct PrepareContext {
+    pub font: FontId,
+    pub bounds: (Vec2D, Vec2D),
+    /// The render target the frame is drawn into, to return to after drawing
+    /// into an offscreen image.
+    pub target: RenderTarget,
+    /// Offscreen images made for this frame. The renderer deletes them after
+    /// the frame is flushed, because the queued commands still read them.
+    pub images: Vec<ImageId>,
+}
+
 pub trait Drawable: DrawableClone + Debug + AsAny {
     fn draw(&self, canvas: &mut Canvas<OpenGl>, font: FontId, bounds: (Vec2D, Vec2D))
     -> Result<()>;
+    /// Draws into offscreen images what `draw` uses later in the same frame.
+    /// femtovg does not tell which render target is current, so the renderer
+    /// calls this before it draws anything, with the target to return to.
+    fn prepare(&self, canvas: &mut Canvas<OpenGl>, context: &mut PrepareContext) -> Result<()> {
+        let _ = (canvas, context);
+        Ok(())
+    }
+    /// The projective transformation this drawable is shown through, and the
+    /// bounds of the plane it is applied to. Without one, the plane is the
+    /// image itself.
+    fn perspective(&self) -> Option<(Homography, (Vec2D, Vec2D))> {
+        None
+    }
     fn draw_baselayer(
         &self,
         canvas: &mut Canvas<OpenGl>,
@@ -216,6 +242,18 @@ pub trait Drawable: DrawableClone + Debug + AsAny {
     ) -> Result<()> {
         let _ = image;
         self.draw(canvas, font, bounds)
+    }
+    /// For an effect on the screenshot, such as a blur, the paint that shows
+    /// the effect over its bounds, so that any path within them can be filled
+    /// with it. `None` for any other drawable.
+    fn effect_paint(
+        &self,
+        canvas: &mut Canvas<OpenGl>,
+        image: &ImgVec<RGBA8>,
+        bounds: (Vec2D, Vec2D),
+    ) -> Result<Option<Paint>> {
+        let _ = (canvas, image, bounds);
+        Ok(None)
     }
     fn handle_undo(&mut self) {}
     fn handle_redo(&mut self) {}
@@ -376,7 +414,8 @@ pub use highlight::{HighlightTool, Highlighters};
 pub use image::{ImagePlacement, ImageTool};
 pub use line::LineTool;
 pub use pixelate::PixelateTool;
-pub use pointer::PointerTool;
+pub use pointer::{Frame, PointerTool};
+pub use projected::Projected;
 pub use rectangle::RectangleTool;
 pub use text::{Text, TextTool};
 

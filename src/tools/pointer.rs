@@ -12,11 +12,14 @@ use std::cell::Cell;
 
 use crate::{
     configuration::APP_CONFIG,
-    math::{SegmentResizeTarget, Vec2D, ensure_bounding_box, get_closest_aspect_ratio},
+    math::{
+        SegmentResizeTarget, Vec2D, ensure_bounding_box, get_closest_aspect_ratio,
+        homography::{Homography, Quad, outset_quad},
+    },
     sketch_board::{KeyEventMsg, MouseButton, MouseEventMsg, MouseEventType, SketchBoardInput},
     tools::{
-        RenderingMode,
-        drag_box::{draw_center_marker, draw_rect_marker},
+        Projected, RenderingMode,
+        drag_box::{draw_center_marker, draw_quad_marker, draw_rect_marker},
     },
 };
 
@@ -26,6 +29,108 @@ use super::{Drawable, InputContext, Tool, ToolUpdateResult, Tools};
 const HANDLE_SIZE: f32 = 11.0;
 const HANDLE_HALF: f32 = HANDLE_SIZE / 2.0;
 const SELECTION_BORDER_OUTSET: f32 = 4.0;
+// halvings of the drag that look for where a distorted quad stops being convex
+const DISTORT_SEARCH_STEPS: usize = 16;
+
+// Ctrl and Shift each already change a resize on their own
+fn is_distort(modifier: ModifierType) -> bool {
+    modifier.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK)
+}
+
+/// The selection frame: the bounds of the selected drawable in its own plane,
+/// and the projection of that plane onto the image, if it has one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frame {
+    tl: Vec2D,
+    br: Vec2D,
+    h: Option<Homography>,
+}
+
+impl Frame {
+    pub fn of(drawable: &dyn Drawable) -> Option<Self> {
+        match drawable.perspective() {
+            Some((h, (tl, br))) => Some(Self { tl, br, h: Some(h) }),
+            None => drawable.bounds().map(|(tl, br)| {
+                let (tl, br) = ensure_bounding_box(tl, br);
+                Self { tl, br, h: None }
+            }),
+        }
+    }
+
+    // `p` in the plane, where it is on the image
+    fn on_image(&self, p: Vec2D) -> Vec2D {
+        self.h.map_or(p, |h| h.apply(p))
+    }
+
+    fn quad(&self) -> Quad {
+        let (tl, br) = (self.tl, self.br);
+        [tl, Vec2D::new(br.x, tl.y), br, Vec2D::new(tl.x, br.y)].map(|p| self.on_image(p))
+    }
+
+    fn handle_pos(&self, handle: ResizeHandle) -> Vec2D {
+        self.on_image(handle.center(self.tl, self.br))
+    }
+
+    fn with_bounds(&self, tl: Vec2D, br: Vec2D) -> Self {
+        let (tl, br) = ensure_bounding_box(tl, br);
+        Self { tl, br, h: self.h }
+    }
+
+    fn translated(&self, delta: Vec2D) -> Self {
+        match self.h {
+            Some(h) => Self {
+                h: Some(h.then_translate(delta)),
+                ..*self
+            },
+            None => self.with_bounds(self.tl + delta, self.br + delta),
+        }
+    }
+
+    // the drag from `start` by `delta` on the image, as a drag in the plane
+    fn plane_delta(&self, start: Vec2D, delta: Vec2D) -> Vec2D {
+        match self.h.and_then(|h| h.inverse()) {
+            // past the horizon of the plane, the pointer has no place in it
+            Some(inverse) if inverse.denominator(start + delta) <= 0.0 => Vec2D::zero(),
+            Some(inverse) => inverse.apply(start + delta) - inverse.apply(start),
+            None => delta,
+        }
+    }
+
+    // `drawable`, whose frame this is, projected so that the corners under
+    // `handle` move by `delta` on the image; a corner stops where the
+    // projection would no longer be accepted
+    fn distort(
+        &self,
+        drawable: &dyn Drawable,
+        handle: ResizeHandle,
+        delta: Vec2D,
+    ) -> Option<Box<dyn Drawable>> {
+        let quad = self.quad();
+        let moved = |t: f32| {
+            let mut q = quad;
+            for &i in handle.corners() {
+                q[i] += delta * t;
+            }
+            q
+        };
+        let accepted = |t: f32| Projected::projection(self.tl, self.br, &moved(t)).is_some();
+        let fraction = if accepted(1.0) {
+            1.0
+        } else {
+            let (mut valid, mut invalid) = (0.0, 1.0);
+            for _ in 0..DISTORT_SEARCH_STEPS {
+                let t = (valid + invalid) / 2.0;
+                if accepted(t) {
+                    valid = t;
+                } else {
+                    invalid = t;
+                }
+            }
+            valid
+        };
+        Projected::project(drawable, &moved(fraction))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ResizeHandle {
@@ -51,6 +156,20 @@ impl ResizeHandle {
             ResizeHandle::BottomCenter,
             ResizeHandle::BottomRight,
         ]
+    }
+
+    // the indices into a `Quad` of the corners a distortion moves
+    fn corners(&self) -> &'static [usize] {
+        match self {
+            ResizeHandle::TopLeft => &[0],
+            ResizeHandle::TopCenter => &[0, 1],
+            ResizeHandle::TopRight => &[1],
+            ResizeHandle::MiddleRight => &[1, 2],
+            ResizeHandle::BottomRight => &[2],
+            ResizeHandle::BottomCenter => &[2, 3],
+            ResizeHandle::BottomLeft => &[3],
+            ResizeHandle::MiddleLeft => &[3, 0],
+        }
     }
 
     pub fn center(&self, tl: Vec2D, br: Vec2D) -> Vec2D {
@@ -314,17 +433,12 @@ impl ResizeHandle {
     }
 }
 
-// Returns the handle under `pos`, if any, given bounds `(tl, br)`.
-pub fn hit_handle(
-    scaled_handle_size: f32,
-    pos: Vec2D,
-    tl: Vec2D,
-    br: Vec2D,
-) -> Option<ResizeHandle> {
+// Returns the handle under `pos`, if any, given the selection frame.
+fn hit_handle(scaled_handle_size: f32, pos: Vec2D, frame: &Frame) -> Option<ResizeHandle> {
     for h in ResizeHandle::all() {
         let handle_half = scaled_handle_size / 2.0;
 
-        let c = h.center(tl, br);
+        let c = frame.handle_pos(h);
         if (pos.x - c.x).abs() <= handle_half && (pos.y - c.y).abs() <= handle_half {
             return Some(h);
         }
@@ -335,8 +449,7 @@ pub fn hit_handle(
 // Draws a selection rectangle with 8 resize handles on top of the selected drawable.
 #[derive(Clone, Debug)]
 struct SelectionOverlay {
-    tl: Vec2D,
-    br: Vec2D,
+    frame: Frame,
     scale: Cell<f32>,
     centered: bool,
 }
@@ -356,23 +469,29 @@ impl Drawable for SelectionOverlay {
         // to be used at other places where the scale is not available
         self.scale.set(scale);
 
-        // Selection rectangle
+        // Selection rectangle, or the quad of a projected drawable; the bounds
+        // of a straight line have no area, which only the rectangle can outset
         let out_set = SELECTION_BORDER_OUTSET / scale;
-        let tl = self.tl - out_set;
-        let size = (self.br - self.tl) + out_set * 2.0;
-        draw_rect_marker(canvas, tl, size, false);
+        if self.frame.h.is_some() {
+            draw_quad_marker(canvas, &outset_quad(&self.frame.quad(), out_set), false);
+        } else {
+            let tl = self.frame.tl - out_set;
+            let size = (self.frame.br - self.frame.tl) + out_set * 2.0;
+            draw_rect_marker(canvas, tl, size, false);
+        }
 
         // Resize handles
         // draw handles in inverse zoom scale so the visual size stays constant on screen.
         let handle_half = HANDLE_HALF / scale;
         let handle_size = HANDLE_SIZE / scale;
         for handle in ResizeHandle::all() {
-            let tl = handle.center(self.tl, self.br) - handle_half;
+            let tl = self.frame.handle_pos(handle) - handle_half;
             draw_rect_marker(canvas, tl, Vec2D::new(handle_size, handle_size), true);
         }
 
         if self.centered {
-            draw_center_marker(canvas, (self.tl + self.br) / 2.0);
+            let frame = &self.frame;
+            draw_center_marker(canvas, frame.on_image((frame.tl + frame.br) / 2.0));
         }
 
         Ok(())
@@ -385,13 +504,13 @@ enum DragState {
     Moving {
         index: usize,
         original: Box<dyn Drawable>,
-        orig_bounds: (Vec2D, Vec2D),
+        orig_frame: Frame,
     },
     Resizing {
         index: usize,
         original: Box<dyn Drawable>,
         handle: ResizeHandle,
-        orig_bounds: (Vec2D, Vec2D),
+        orig_frame: Frame,
     },
 }
 
@@ -400,7 +519,7 @@ pub struct PointerTool {
     sender: Option<Sender<SketchBoardInput>>,
     cursor_widget: Option<gtk::Widget>,
     selected_index: Option<usize>,
-    selected_bounds: Option<(Vec2D, Vec2D)>,
+    selected_frame: Option<Frame>,
     drag_state: DragState,
     last_drag_state: bool,
     // Shown as the active-tool drawable: either a moved/resized preview, or a selection overlay.
@@ -427,7 +546,7 @@ impl Default for PointerTool {
             sender: None,
             cursor_widget: None,
             selected_index: None,
-            selected_bounds: None,
+            selected_frame: None,
             drag_state: DragState::None,
             last_drag_state: false,
             preview: None,
@@ -518,27 +637,24 @@ impl PointerTool {
         self.selected_index
     }
 
-    pub fn selected_bounds(&self) -> Option<(Vec2D, Vec2D)> {
-        self.selected_bounds
+    pub fn selected_frame(&self) -> Option<Frame> {
+        self.selected_frame
     }
 
-    // Returns the handle under `pos` given the current selection bounds.
+    // Returns the handle under `pos` given the current selection frame.
     pub fn hit_test_handles(&self, pos: Vec2D) -> Option<ResizeHandle> {
         let overlay = self.selection_overlay.as_ref()?;
         let scaled_handle_size = HANDLE_SIZE / overlay.scale.get();
-        hit_handle(scaled_handle_size, pos, overlay.tl, overlay.br)
+        hit_handle(scaled_handle_size, pos, &overlay.frame)
     }
 
     // Called by SketchBoard before delivering a BeginDrag event: sets up a move drag.
-    pub fn begin_move(
-        &mut self,
-        index: usize,
-        drawable: Box<dyn Drawable>,
-        orig_bounds: (Vec2D, Vec2D),
-        start_pos: Vec2D,
-    ) {
+    pub fn begin_move(&mut self, index: usize, drawable: Box<dyn Drawable>, start_pos: Vec2D) {
+        let Some(orig_frame) = Frame::of(drawable.as_ref()) else {
+            return;
+        };
         self.selected_index = Some(index);
-        self.selected_bounds = Some(orig_bounds);
+        self.selected_frame = Some(orig_frame);
         self.selection_overlay = None;
         let drawable_clone = drawable.clone_box();
         self.preview = Some(drawable_clone);
@@ -551,10 +667,10 @@ impl PointerTool {
         self.drag_state = DragState::Moving {
             index,
             original: drawable,
-            orig_bounds,
+            orig_frame,
         };
         self.drag_start_pos = Some(start_pos);
-        self.set_hover_cursor(orig_bounds.0);
+        self.set_hover_cursor(start_pos);
     }
 
     // Called by SketchBoard before delivering a BeginDrag event: sets up a resize drag.
@@ -563,11 +679,13 @@ impl PointerTool {
         index: usize,
         drawable: Box<dyn Drawable>,
         handle: ResizeHandle,
-        orig_bounds: (Vec2D, Vec2D),
         start_pos: Vec2D,
     ) {
+        let Some(orig_frame) = Frame::of(drawable.as_ref()) else {
+            return;
+        };
         self.selected_index = Some(index);
-        self.selected_bounds = Some(orig_bounds);
+        self.selected_frame = Some(orig_frame);
         self.selection_overlay = None;
         self.preview = Some(drawable.clone_box());
         self.last_resize_event = None;
@@ -575,7 +693,7 @@ impl PointerTool {
             index,
             original: drawable,
             handle,
-            orig_bounds,
+            orig_frame,
         };
         self.drag_start_pos = Some(start_pos);
     }
@@ -584,34 +702,61 @@ impl PointerTool {
         self.drag_start_pos.map_or(delta, |start| start + delta)
     }
 
+    // The dragged drawable and its frame after the resize drag `event`. A
+    // resize happens in the plane of the drawable, so a projected drawable
+    // keeps its perspective, and a distortion moves corners on the image.
+    fn resized(
+        original: &dyn Drawable,
+        handle: ResizeHandle,
+        orig_frame: &Frame,
+        start: Vec2D,
+        event: MouseEventMsg,
+    ) -> (Box<dyn Drawable>, Frame) {
+        if is_distort(event.modifier) {
+            let distorted = orig_frame
+                .distort(original, handle, event.pos)
+                .unwrap_or_else(|| original.clone_box());
+            let frame = Frame::of(distorted.as_ref()).unwrap_or(*orig_frame);
+            return (distorted, frame);
+        }
+
+        let event = MouseEventMsg {
+            pos: orig_frame.plane_delta(start, event.pos),
+            ..event
+        };
+        let (new_tl, new_br) = handle.resize(event, orig_frame.tl, orig_frame.br);
+        let mut resized = original.clone_box();
+        let keep_aspect = event
+            .modifier
+            .intersects(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK);
+        resized.resize_bounds_with_segment_target(
+            new_tl,
+            new_br,
+            event.pos,
+            keep_aspect,
+            handle.segment_target(orig_frame.tl, orig_frame.br),
+        );
+        (resized, orig_frame.with_bounds(new_tl, new_br))
+    }
+
     fn update_resize_preview(&mut self, event: MouseEventMsg) {
         let DragState::Resizing {
             original,
             handle,
-            orig_bounds,
+            orig_frame,
             ..
         } = &self.drag_state
         else {
             return;
         };
-
-        let (new_tl, new_br) = handle.resize(event, orig_bounds.0, orig_bounds.1);
-        let mut preview = original.clone_box();
-        let keep_aspect = event
-            .modifier
-            .intersects(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK);
-        preview.resize_bounds_with_segment_target(
-            new_tl,
-            new_br,
-            event.pos,
-            keep_aspect,
-            handle.segment_target(orig_bounds.0, orig_bounds.1),
-        );
+        let start = self.drag_start_pos.unwrap_or_default();
+        let (mut preview, frame) =
+            Self::resized(original.as_ref(), *handle, orig_frame, start, event);
         self.centered = event.modifier.intersects(ModifierType::ALT_MASK);
         preview.set_centered(self.centered);
         preview.set_editing(true);
         self.emit_dimensions_update(preview.as_ref());
-        self.update_selection_bounds(new_tl, new_br);
+        self.update_selection_frame(frame);
         self.preview = Some(preview);
     }
 
@@ -626,12 +771,10 @@ impl PointerTool {
         }
     }
 
-    fn update_selection_bounds(&mut self, tl: Vec2D, br: Vec2D) {
-        let (tl, br) = ensure_bounding_box(tl, br);
-        self.selected_bounds = Some((tl, br));
+    fn update_selection_frame(&mut self, frame: Frame) {
+        self.selected_frame = Some(frame);
         self.selection_overlay = Some(SelectionOverlay {
-            tl,
-            br,
+            frame,
             // is updated in draw() to maintain constant on-screen size regardless of zoom level
             scale: Cell::new(1.0),
             centered: self.centered,
@@ -639,9 +782,9 @@ impl PointerTool {
     }
 
     // Select a drawable without starting a drag (e.g. after a commit/replace).
-    pub fn set_selection(&mut self, index: usize, bounds: (Vec2D, Vec2D)) {
+    pub fn set_selection(&mut self, index: usize, frame: Frame) {
         self.selected_index = Some(index);
-        self.update_selection_bounds(bounds.0, bounds.1);
+        self.update_selection_frame(frame);
         self.drag_state = DragState::None;
         self.preview = None;
         self.last_resize_event = None;
@@ -649,7 +792,7 @@ impl PointerTool {
 
     pub fn deselect(&mut self) {
         self.selected_index = None;
-        self.selected_bounds = None;
+        self.selected_frame = None;
         self.selection_overlay = None;
         self.drag_state = DragState::None;
         self.preview = None;
@@ -810,15 +953,15 @@ impl Tool for PointerTool {
             MouseEventType::UpdateDrag => match &self.drag_state {
                 DragState::Moving {
                     original,
-                    orig_bounds,
+                    orig_frame,
                     ..
                 } => {
                     let delta = event.pos;
                     let mut preview = original.clone_box();
                     preview.translate(delta);
                     self.emit_dimensions_update(preview.as_ref());
-                    let (tl, br) = *orig_bounds;
-                    self.update_selection_bounds(tl + delta, br + delta);
+                    let frame = orig_frame.translated(delta);
+                    self.update_selection_frame(frame);
                     self.preview = Some(preview);
                     ToolUpdateResult::Redraw
                 }
@@ -837,22 +980,20 @@ impl Tool for PointerTool {
                     DragState::Moving {
                         index,
                         original,
-                        orig_bounds,
+                        orig_frame,
                     } => {
                         let delta = event.pos;
                         let not_renderable =
                             self.preview.as_ref().is_some_and(|p| !p.is_renderable());
                         let result = if delta.is_zero() || not_renderable {
                             // Click with no movement: just show selection overlay
-                            self.update_selection_bounds(orig_bounds.0, orig_bounds.1);
+                            self.update_selection_frame(orig_frame);
                             self.preview = None;
                             ToolUpdateResult::Redraw
                         } else {
                             let mut final_drawable = original;
                             final_drawable.translate(delta);
-                            let (tl, br) = orig_bounds;
-                            let new_bounds = (tl + delta, br + delta);
-                            self.update_selection_bounds(new_bounds.0, new_bounds.1);
+                            self.update_selection_frame(orig_frame.translated(delta));
                             self.preview = None;
                             ToolUpdateResult::ReplaceDrawable(index, final_drawable)
                         };
@@ -864,35 +1005,36 @@ impl Tool for PointerTool {
                         index,
                         original,
                         handle,
-                        orig_bounds,
+                        orig_frame,
                     } => {
                         let delta = event.pos;
                         let not_renderable =
                             self.preview.as_ref().is_some_and(|p| !p.is_renderable());
-                        let result = if delta.is_zero() || not_renderable {
-                            self.update_selection_bounds(orig_bounds.0, orig_bounds.1);
-                            self.preview = None;
-                            ToolUpdateResult::Redraw
+                        let resized = if delta.is_zero() || not_renderable {
+                            None
                         } else {
-                            let (new_tl, new_br) =
-                                handle.resize(event, orig_bounds.0, orig_bounds.1);
-                            let mut final_drawable = original;
-                            let keep_aspect = event
-                                .modifier
-                                .intersects(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK);
-                            final_drawable.resize_bounds_with_segment_target(
-                                new_tl,
-                                new_br,
-                                event.pos,
-                                keep_aspect,
-                                handle.segment_target(orig_bounds.0, orig_bounds.1),
-                            );
-                            final_drawable.set_centered(false);
-                            final_drawable.set_editing(false);
-                            self.update_selection_bounds(new_tl, new_br);
-                            self.preview = None;
-                            ToolUpdateResult::ReplaceDrawable(index, final_drawable)
+                            let start = self.drag_start_pos.unwrap_or_default();
+                            Some(Self::resized(
+                                original.as_ref(),
+                                handle,
+                                &orig_frame,
+                                start,
+                                event,
+                            ))
                         };
+                        let result = match resized {
+                            Some((mut final_drawable, frame)) => {
+                                final_drawable.set_centered(false);
+                                final_drawable.set_editing(false);
+                                self.update_selection_frame(frame);
+                                ToolUpdateResult::ReplaceDrawable(index, final_drawable)
+                            }
+                            None => {
+                                self.update_selection_frame(orig_frame);
+                                ToolUpdateResult::Redraw
+                            }
+                        };
+                        self.preview = None;
                         self.drag_start_pos = None;
                         self.set_hover_cursor(current_pos);
                         result
@@ -915,5 +1057,164 @@ impl Tool for PointerTool {
     fn set_im_context(&mut self, context: Option<InputContext>) {
         self.cursor_widget = context.map(|ctx| ctx.widget);
         self.clear_hover_cursor();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // a drawable that is nothing but its bounds
+    #[derive(Clone, Debug)]
+    struct Bounds {
+        tl: Vec2D,
+        br: Vec2D,
+    }
+
+    impl Drawable for Bounds {
+        fn draw(
+            &self,
+            _canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
+            _font: FontId,
+            _bounds: (Vec2D, Vec2D),
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn bounds(&self) -> Option<(Vec2D, Vec2D)> {
+            Some((self.tl, self.br))
+        }
+
+        fn resize_bounds(&mut self, tl: Vec2D, br: Vec2D, _delta: Vec2D, _keep_aspect: bool) {
+            (self.tl, self.br) = ensure_bounding_box(tl, br);
+        }
+    }
+
+    fn close(a: Vec2D, b: Vec2D) -> bool {
+        (a - b).norm() < 1e-2
+    }
+
+    fn plain() -> (Box<dyn Drawable>, Frame) {
+        let drawable: Box<dyn Drawable> = Box::new(Bounds {
+            tl: Vec2D::new(100.0, 100.0),
+            br: Vec2D::new(300.0, 200.0),
+        });
+        let frame = Frame::of(drawable.as_ref()).unwrap();
+        (drawable, frame)
+    }
+
+    fn drag(delta: Vec2D, modifier: ModifierType) -> MouseEventMsg {
+        MouseEventMsg {
+            type_: MouseEventType::UpdateDrag,
+            button: MouseButton::Primary,
+            modifier,
+            screen_pos: Vec2D::zero(),
+            is_touchpad: false,
+            pos: delta,
+            n_pressed: 1,
+            release: false,
+        }
+    }
+
+    // the drawable with its top right corner pulled in, so it has a perspective
+    fn projected() -> (Box<dyn Drawable>, Frame) {
+        let (drawable, frame) = plain();
+        let drawable = frame
+            .distort(
+                drawable.as_ref(),
+                ResizeHandle::TopRight,
+                Vec2D::new(-20.0, 30.0),
+            )
+            .unwrap();
+        let frame = Frame::of(drawable.as_ref()).unwrap();
+        (drawable, frame)
+    }
+
+    #[test]
+    fn distorting_a_corner_moves_only_that_corner() {
+        let (drawable, frame) = plain();
+        let delta = Vec2D::new(-20.0, 30.0);
+        let distorted = frame
+            .distort(drawable.as_ref(), ResizeHandle::TopRight, delta)
+            .unwrap();
+        let (before, after) = (frame.quad(), Frame::of(distorted.as_ref()).unwrap().quad());
+        assert!(close(after[1], before[1] + delta));
+        for i in [0, 2, 3] {
+            assert!(close(after[i], before[i]), "corner {i}");
+        }
+    }
+
+    #[test]
+    fn distorting_an_edge_moves_both_of_its_corners() {
+        let (drawable, frame) = plain();
+        let delta = Vec2D::new(15.0, -10.0);
+        let distorted = frame
+            .distort(drawable.as_ref(), ResizeHandle::MiddleLeft, delta)
+            .unwrap();
+        let (before, after) = (frame.quad(), Frame::of(distorted.as_ref()).unwrap().quad());
+        for i in [3, 0] {
+            assert!(close(after[i], before[i] + delta), "corner {i}");
+        }
+        for i in [1, 2] {
+            assert!(close(after[i], before[i]), "corner {i}");
+        }
+    }
+
+    #[test]
+    fn a_distortion_stops_where_the_projection_is_rejected() {
+        let (drawable, frame) = plain();
+        // past the opposite corner, which would fold the quad
+        let delta = Vec2D::new(-400.0, 300.0);
+        let distorted = frame
+            .distort(drawable.as_ref(), ResizeHandle::TopRight, delta)
+            .unwrap();
+        let after = Frame::of(distorted.as_ref()).unwrap();
+        assert!(Projected::projection(after.tl, after.br, &after.quad()).is_some());
+        let moved = after.quad()[1] - frame.quad()[1];
+        assert!(moved.norm() > 1.0 && moved.norm() < delta.norm());
+    }
+
+    #[test]
+    fn a_resize_follows_the_pointer_and_keeps_the_projection() {
+        let (drawable, frame) = projected();
+        let handle = ResizeHandle::MiddleRight;
+        let start = frame.handle_pos(handle);
+        // along the projected right edge's normal is not a plane direction, so
+        // only check where the handle lands along the plane's x axis
+        let delta = Vec2D::new(40.0, 0.0);
+        let (resized, after) = PointerTool::resized(
+            drawable.as_ref(),
+            handle,
+            &frame,
+            start,
+            drag(delta, ModifierType::empty()),
+        );
+
+        assert_eq!(after.h, frame.h);
+        assert_eq!(Frame::of(resized.as_ref()).unwrap(), after);
+        // the dragged edge moved in the plane only, and the pointer is on its
+        // line through the handle
+        assert_eq!(after.tl, frame.tl);
+        assert!(after.br.x > frame.br.x);
+        let h = frame.h.unwrap();
+        let inverse = h.inverse().unwrap();
+        assert!((inverse.apply(start + delta).x - after.br.x).abs() < 1e-2);
+    }
+
+    #[test]
+    fn a_resize_past_the_horizon_of_the_plane_is_ignored() {
+        let (_, frame) = projected();
+        let start = frame.handle_pos(ResizeHandle::MiddleRight);
+        let far = Vec2D::new(1e6, 0.0);
+        assert_eq!(frame.plane_delta(start, far), Vec2D::zero());
+    }
+
+    #[test]
+    fn only_ctrl_and_shift_together_distort() {
+        assert!(is_distort(
+            ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK
+        ));
+        assert!(!is_distort(ModifierType::CONTROL_MASK));
+        assert!(!is_distort(ModifierType::SHIFT_MASK));
     }
 }

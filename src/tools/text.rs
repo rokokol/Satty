@@ -15,12 +15,12 @@ use crate::{
     configuration::APP_CONFIG,
     femtovg_area,
     ime::preedit::{Preedit, UnderlineKind},
-    math::Vec2D,
+    math::{Vec2D, homography::Homography},
     sketch_board::{KeyEventMsg, MouseButton, MouseEventMsg, MouseEventType, TextEventMsg},
     style::Style,
 };
 
-use super::{Drawable, DrawableClone, InputContext, Tool, ToolUpdateResult, Tools};
+use super::{Drawable, DrawableClone, InputContext, Projected, Tool, ToolUpdateResult, Tools};
 use crate::sketch_board::SketchBoardInput;
 use relm4::Sender;
 use relm4::gtk::gdk::DisplayManager;
@@ -856,6 +856,23 @@ pub struct TextTool {
     dragged: Rc<RefCell<bool>>,
     alt_tap: bool,
     editing_existing: bool,
+    // the projection the text being edited was shown through
+    projection: Option<Homography>,
+}
+
+impl TextTool {
+    fn drop_text(&mut self) {
+        self.text = None;
+        self.projection = None;
+    }
+
+    // commits `text`, shown through the projection it had before editing
+    fn commit(&mut self, text: Box<dyn Drawable>) -> ToolUpdateResult {
+        ToolUpdateResult::Commit(match self.projection.take() {
+            Some(h) => Box::new(Projected::from_parts(text, h)),
+            None => text,
+        })
+    }
 }
 
 impl Tool for TextTool {
@@ -966,7 +983,7 @@ impl Tool for TextTool {
                     _ => {
                         let content = t.get_text();
                         if content.is_empty() {
-                            self.text = None;
+                            self.drop_text();
                             self.input_enabled = false;
                             tool_update_result = ToolUpdateResult::RedrawAndStopPropagation;
                         } else {
@@ -979,15 +996,15 @@ impl Tool for TextTool {
                             );
                             *t.draw_rect.borrow_mut() = false;
                             let result = t.clone_box();
-                            self.text = None;
+                            tool_update_result = self.commit(result);
+                            self.drop_text();
                             self.input_enabled = false;
-                            tool_update_result = ToolUpdateResult::Commit(result);
                         }
                     }
                 },
                 Key::Escape => {
                     self.input_enabled = false;
-                    self.text = None;
+                    self.drop_text();
                     tool_update_result = ToolUpdateResult::Redraw;
                 }
                 Key::Alt_L | Key::Alt_R => {
@@ -1328,11 +1345,11 @@ impl Tool for TextTool {
                         let editing_existing = self.editing_existing;
 
                         // create commit message if necessary
-                        let return_value = match &mut self.text {
+                        let committed = match &mut self.text {
                             Some(l) => {
                                 let content = l.get_text();
                                 if content.is_empty() {
-                                    ToolUpdateResult::Redraw
+                                    None
                                 } else {
                                     l.preedit = None;
                                     l.editing = false;
@@ -1342,19 +1359,24 @@ impl Tool for TextTool {
                                         &l.text_buffer.start_iter(),
                                     );
                                     *l.draw_rect.borrow_mut() = false;
-                                    ToolUpdateResult::Commit(l.clone_box())
+                                    Some(l.clone_box())
                                 }
                             }
+                            None => None,
+                        };
+                        let return_value = match committed {
+                            Some(text) => self.commit(text),
                             None => ToolUpdateResult::Redraw,
                         };
 
                         if editing_existing {
                             // Pointer-initiated edit: finish editing and let SketchBoard switch tool.
-                            self.text = None;
+                            self.drop_text();
                             self.set_input_enabled(false);
                             self.editing_existing = false;
                         } else {
                             // Native text-tool behavior: commit current text and start a new one.
+                            self.drop_text();
                             self.text =
                                 Some(Text::new(event.pos, self.style, self.im_context.clone()));
                             self.set_input_enabled(true);
@@ -1486,7 +1508,7 @@ impl Tool for TextTool {
             let content = t.get_text();
             if content.is_empty() {
                 // Don't create empty text objects
-                self.text = None;
+                self.drop_text();
                 ToolUpdateResult::Redraw
             } else {
                 t.preedit = None;
@@ -1496,9 +1518,10 @@ impl Tool for TextTool {
                     .select_range(&t.text_buffer.start_iter(), &t.text_buffer.start_iter());
                 *t.draw_rect.borrow_mut() = false;
                 let result = t.clone_box();
-                self.text = None;
+                let committed = self.commit(result);
+                self.drop_text();
                 self.input_enabled = false;
-                ToolUpdateResult::Commit(result)
+                committed
             }
         } else {
             ToolUpdateResult::Unmodified
@@ -1925,7 +1948,9 @@ impl TextTool {
 
     // Pre-populate the tool with an existing text drawable so the user can edit it.
     // Call this before switching to the Text tool.
-    pub fn load_for_editing(&mut self, mut text: Text) {
+    /// Edits `text`, which is committed again through `projection`.
+    pub fn load_for_editing(&mut self, mut text: Text, projection: Option<Homography>) {
+        self.projection = projection;
         text.editing = true;
         text.preedit = None;
         text.im_context = self.im_context.clone();

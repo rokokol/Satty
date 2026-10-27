@@ -194,6 +194,7 @@ Newly created annotations can be autoselected if enabled in the config.
   - Hold <kbd>Shift</kbd> to snap to defined aspect ratios. <sup>NEXTRELEASE</sup>
   - Hold <kbd>Control</kbd> at corners for aspect ratio preserving resize. <sup>NEXTRELEASE</sup>
   - Hold mutiple to combine them.
+  - Hold <kbd>Control+Shift</kbd> to drag a corner, or both corners of an edge, freely and show the annotation in perspective. A resize without it keeps the perspective. <sup>NEXTRELEASE</sup>
 - Grab an annotation - mouse cursor will change to a hand - to move.
 - Scroll up/down with the mouse wheel to change the annotation's layer.
 - Nudge (small move) with the cursor keys.

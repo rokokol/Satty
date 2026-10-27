@@ -1,7 +1,11 @@
 use std::cell::RefCell;
 
 use anyhow::Result;
-use femtovg::{Color, ImageFilter, ImageFlags, ImageId, Paint, Path, imgref::Img};
+use femtovg::{
+    Color, ImageFilter, ImageFlags, ImageId, Paint, Path,
+    imgref::{Img, ImgVec},
+    rgb::RGBA8,
+};
 
 use relm4::{Sender, gtk::gdk::Key};
 
@@ -114,67 +118,79 @@ impl Drawable for Blur {
         Some(&mut self.style)
     }
 
-    fn draw(
+    fn effect_paint(
         &self,
         canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
-        _font: femtovg::FontId,
+        _image: &ImgVec<RGBA8>,
         bounds: (Vec2D, Vec2D),
-    ) -> Result<()> {
-        let size = self.size;
+    ) -> Result<Option<Paint>> {
         let (pos, size) = math::rect_ensure_in_bounds(
-            math::rect_ensure_positive_size(self.top_left, size),
+            math::rect_ensure_positive_size(self.top_left, self.size),
             bounds,
         );
         if self.editing {
-            // set style
             let mut color = Color::black();
             color.set_alphaf(0.6);
-            let paint = Paint::color(color);
+            return Ok(Some(Paint::color(color)));
+        }
+        if size.x <= 0.0 || size.y <= 0.0 {
+            return Ok(None);
+        }
 
-            // make rect
+        // create new cached image
+        if self.cached_image.borrow().is_none() {
+            self.cached_image.borrow_mut().replace(Self::blur(
+                canvas,
+                pos,
+                size,
+                self.style
+                    .size
+                    .to_blur_factor(self.style.annotation_size_factor),
+            )?);
+        }
+
+        Ok(Some(Paint::image(
+            self.cached_image.borrow().unwrap(), // this unwrap is safe because we placed it above
+            pos.x,
+            pos.y,
+            size.x,
+            size.y,
+            0f32,
+            1f32,
+        )))
+    }
+
+    fn draw_baselayer(
+        &self,
+        canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
+        image: &ImgVec<RGBA8>,
+        _font: femtovg::FontId,
+        bounds: (Vec2D, Vec2D),
+    ) -> Result<()> {
+        let (pos, size) = math::rect_ensure_in_bounds(
+            math::rect_ensure_positive_size(self.top_left, self.size),
+            bounds,
+        );
+        if let Some(paint) = self.effect_paint(canvas, image, bounds)? {
             let mut path = Path::new();
             path.rounded_rect(pos.x, pos.y, size.x, size.y, self.style.corner_radius());
-
-            // draw
             canvas.fill_path(&path, &paint);
-        } else {
-            if size.x <= 0.0 || size.y <= 0.0 {
-                return Ok(());
-            }
-
-            // create new cached image
-            if self.cached_image.borrow().is_none() {
-                self.cached_image.borrow_mut().replace(Self::blur(
-                    canvas,
-                    pos,
-                    size,
-                    self.style
-                        .size
-                        .to_blur_factor(self.style.annotation_size_factor),
-                )?);
-            }
-
-            let mut path = Path::new();
-            path.rounded_rect(pos.x, pos.y, size.x, size.y, self.style.corner_radius());
-
-            canvas.fill_path(
-                &path,
-                &Paint::image(
-                    self.cached_image.borrow().unwrap(), // this unwrap is safe because we placed it above
-                    pos.x,
-                    pos.y,
-                    size.x,
-                    size.y,
-                    0f32,
-                    1f32,
-                ),
-            );
         }
 
         if self.editing && self.centered {
             draw_center_marker(canvas, self.origin);
         }
 
+        Ok(())
+    }
+
+    // the blur needs the screenshot, see draw_baselayer
+    fn draw(
+        &self,
+        _canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
+        _font: femtovg::FontId,
+        _bounds: (Vec2D, Vec2D),
+    ) -> Result<()> {
         Ok(())
     }
 
